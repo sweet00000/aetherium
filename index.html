@@ -116,7 +116,7 @@
         </div>
 
         <button id="btn-download" onclick="triggerDownload()" disabled>
-            ⬇️ Download & Visualize Selected
+            Visualize Selected
         </button>
 
         <div id="log"></div>
@@ -339,7 +339,7 @@
             
             const btn = document.getElementById("btn-download");
             btn.disabled = false;
-            btn.innerHTML = `⬇️ DOWNLOAD ${t.id}`;
+            btn.innerHTML = `Visualize ${t.id}`;
 
             highlightLayer.clearLayers();
             const bounds = [[t.lat - 0.05, t.lon - 0.05], [t.lat + 0.05, t.lon + 0.05]];
@@ -387,3 +387,4 @@
     </script>
 </body>
 </html>
+
