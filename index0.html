@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>GeoTessera Visualizer</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+
+    <style>
+        /* LAYOUT */
+        body { margin: 0; display: flex; height: 100vh; font-family: 'Segoe UI', sans-serif; background: #111; color: #eee; }
+        
+        #sidebar { 
+            width: 360px; background: #1e1e1e; 
+            padding: 20px; display: flex; flex-direction: column; gap: 15px; 
+            border-right: 1px solid #333; z-index: 1000;
+        }
+        
+        #map { flex: 1; z-index: 1; }
+        
+        h3 { margin: 0; color: #fff; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        
+        /* ORANGE BUTTONS */
+        button { 
+            padding: 12px; background: #ff7800; color: white; border: none; 
+            cursor: pointer; border-radius: 4px; font-weight: bold; width: 100%; 
+            transition: background 0.2s, transform 0.1s; text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        button:disabled { background: #333; color: #666; cursor: not-allowed; transform: none; }
+        button:not(:disabled):hover { background: #ff9033; transform: translateY(-1px); }
+        button:not(:disabled):active { transform: translateY(0); }
+
+        /* CONTROLS ROW */
+        .controls-row { display: flex; gap: 10px; align-items: center; }
+        
+        select {
+            padding: 10px; background: #333; color: white; border: 1px solid #444; 
+            border-radius: 4px; font-weight: bold; cursor: pointer; flex: 1;
+        }
+
+        /* LIST & SELECTION */
+        #results-header { font-size: 11px; font-weight: bold; color: #888; display: flex; justify-content: space-between; text-transform: uppercase; }
+        
+        #tile-grid {
+            flex: 1; overflow-y: auto; border: 1px solid #333; background: #111;
+            border-radius: 4px;
+        }
+        
+        .tile-item {
+            padding: 10px; border-bottom: 1px solid #222; cursor: pointer; 
+            display: flex; align-items: center; justify-content: space-between;
+            transition: background 0.1s;
+        }
+        .tile-item:hover { background: #2a2a2a; }
+        .tile-item.active { background: #332200; border-left: 4px solid #ff7800; }
+        .tile-item.active .tile-id { color: #ff7800; }
+        
+        .tile-info { display: flex; flex-direction: column; gap: 2px; }
+        .tile-id { font-family: monospace; font-size: 13px; color: #aaa; font-weight: bold; }
+        .tile-meta { font-size: 11px; color: #666; }
+        
+        /* LOG & SPINNER */
+        #log { 
+            height: 100px; background: #000; color: #0f0; 
+            padding: 8px; font-family: monospace; font-size: 10px;
+            overflow-y: auto; border-top: 1px solid #333; position: relative;
+        }
+        
+        .spinner {
+            display: inline-block; width: 10px; height: 10px; margin-right: 8px;
+            border: 2px solid #0f0; border-radius: 50%; border-top-color: transparent;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .status { padding: 8px; background: #d35400; color: white; border-radius: 4px; font-size: 12px; font-weight: bold; text-align: center;}
+        .ready { background: #28a745; }
+        
+        .dl-btn {
+            display: inline-block; padding: 6px 12px; margin-top: 5px;
+            background: #ff7800; color: white; text-decoration: none;
+            border-radius: 3px; font-size: 12px;
+        }
+        .dl-btn:hover { background: #ff9033; }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <h3>🛰️ GeoTessera</h3>
+        <div id="status" class="status">Initializing Python...</div>
+
+        <div class="controls-row">
+            <button id="btn-scan" py-click="scan_area" style="flex: 2;" disabled>
+                🔍 Scan
+            </button>
+            <select id="year-filter" onchange="filterList()" disabled>
+                <option value="all">All Years</option>
+                <option value="2024">2024</option>
+                <option value="2023">2023</option>
+                <option value="2022">2022</option>
+            </select>
+        </div>
+
+        <div id="results-header">
+            <span>Select a tile below:</span>
+            <span id="count-badge">0 found</span>
+        </div>
+        
+        <div id="tile-grid">
+            <div style="padding:15px; color:#555; text-align:center; font-size:12px;">
+                Pan map to area & click Scan
+            </div>
+        </div>
+
+        <button id="btn-download" onclick="triggerDownload()" disabled>
+            ⬇️ Download & Visualize Selected
+        </button>
+
+        <div id="log"></div>
+    </div>
+
+    <div id="map"></div>
+
+    <py-config>
+        packages = ["numpy", "pandas", "fastparquet", "pillow"]
+    </py-config>
+
+    <script type="py">
+        import js
+        import numpy as np
+        import pandas as pd
+        import io
+        import base64
+        import json
+        from PIL import Image
+        from pyodide.http import pyfetch
+        from pyscript import document
+
+        WORKER_PROXY = "https://geo.sweetxander.workers.dev/?url="
+        REGISTRY_URL = "https://dl2.geotessera.org/v1/registry.parquet"
+        BASE_DATA_URL = "https://dl2.geotessera.org/v1/global_0.1_degree_representation/"
+
+        class AppState:
+            def __init__(self):
+                self.registry = None
+                self.tiles_cache = {} 
+        
+        state = AppState()
+
+        def log(msg, loading=False):
+            console = document.getElementById("log")
+            div = document.createElement("div")
+            
+            if loading:
+                div.innerHTML = f'<span class="spinner"></span> {msg}'
+                div.id = "active-loading"
+            else:
+                div.innerText = "> " + str(msg)
+                old = document.getElementById("active-loading")
+                if old: old.remove()
+                
+            console.prepend(div)
+
+        # 1. INIT
+        async def main():
+            log("Downloading Registry...", loading=True)
+            try:
+                response = await pyfetch(WORKER_PROXY + REGISTRY_URL)
+                data = await response.bytes()
+                buffer = io.BytesIO(data)
+                state.registry = pd.read_parquet(buffer, engine='fastparquet')
+                
+                log(f"✅ Registry Loaded ({len(state.registry)} tiles).")
+                st = document.getElementById("status")
+                st.innerText = "System Ready"
+                st.classList.add("ready")
+                document.getElementById("btn-scan").removeAttribute("disabled")
+                document.getElementById("year-filter").removeAttribute("disabled")
+            except Exception as e:
+                log(f"❌ Init Error: {e}")
+
+        # 2. SCAN
+        def scan_area(event):
+            if state.registry is None: return
+
+            center = js.window.map.getCenter()
+            lat, lon = center.lat, center.lng
+            log(f"📍 Scanning near {lat:.4f}, {lon:.4f}...", loading=True)
+
+            # Find nearest 50 tiles (grabbing more so filtering works better)
+            df = state.registry
+            distances = (df['lat'] - lat)**2 + (df['lon'] - lon)**2
+            closest_rows = df.loc[distances.nsmallest(50).index].copy()
+
+            if closest_rows.empty:
+                log("⚠️ No tiles found.")
+                return
+
+            tiles_list = []
+            state.tiles_cache = {}
+
+            for idx, row in closest_rows.iterrows():
+                fmt_lon = f"{row['lon']:.2f}"
+                fmt_lat = f"{row['lat']:.2f}"
+                year = int(row['year'])
+                
+                grid_id = f"grid_{fmt_lon}_{fmt_lat}"
+                full_url = f"{BASE_DATA_URL}{year}/{grid_id}/{grid_id}.npy"
+                
+                tile_obj = {
+                    "id": grid_id,
+                    "lat": row['lat'],
+                    "lon": row['lon'],
+                    "year": year,
+                    "url": full_url,
+                    "proxy_url": WORKER_PROXY + full_url
+                }
+                
+                tiles_list.append(tile_obj)
+                state.tiles_cache[grid_id] = tile_obj
+
+            log(f"🎯 Found candidates.")
+            js.render_grid(json.dumps(tiles_list))
+
+        # 3. DOWNLOAD
+        async def project_tile(grid_id):
+            if grid_id not in state.tiles_cache: return
+            
+            t = state.tiles_cache[grid_id]
+            log(f"⬇️ Downloading {t['id']}...", loading=True)
+
+            try:
+                res = await pyfetch(t['proxy_url'])
+                if res.status != 200:
+                    log(f"❌ HTTP {res.status} - Missing")
+                    return
+
+                data = await res.bytes()
+                buffer = io.BytesIO(data)
+                arr = np.load(buffer)
+                
+                if arr.shape[0] == 128: arr = arr.transpose(1, 2, 0)
+                
+                rgb = arr[:, :, 0:3].astype(float)
+                p2, p98 = np.percentile(rgb, (2, 98))
+                rgb = np.clip((rgb - p2) / (p98 - p2), 0, 1) * 255
+                
+                img = Image.fromarray(rgb.astype(np.uint8))
+                out = io.BytesIO()
+                img.save(out, format="PNG")
+                b64 = base64.b64encode(out.getvalue()).decode('utf-8')
+                data_uri = f"data:image/png;base64,{b64}"
+
+                bounds = [
+                    [t['lat'] - 0.05, t['lon'] - 0.05], 
+                    [t['lat'] + 0.05, t['lon'] + 0.05]
+                ]
+
+                log(f"✨ Projecting {t['id']}")
+                js.add_overlay(data_uri, json.dumps(bounds), t['url'], t['id'])
+
+            except Exception as e:
+                log(f"❌ Error: {e}")
+
+        js.window.project_tile_py = project_tile
+
+        import asyncio
+        asyncio.ensure_future(main())
+    </script>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        window.map = L.map('map').setView([52.05, 0.15], 11); 
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; CartoDB'
+        }).addTo(window.map);
+
+        var footprintLayer = L.layerGroup().addTo(window.map); 
+        var highlightLayer = L.layerGroup().addTo(window.map); 
+        var imageLayer = L.layerGroup().addTo(window.map);     
+
+        var allTiles = []; // Store raw data for filtering
+        var currentlySelectedId = null;
+
+        // 1. RECEIVE DATA
+        function render_grid(jsonStr) {
+            allTiles = JSON.parse(jsonStr);
+            filterList(); // Apply current filter immediately
+        }
+
+        // 2. FILTER & RENDER
+        function filterList() {
+            const yearVal = document.getElementById("year-filter").value;
+            const container = document.getElementById("tile-grid");
+            
+            // Filter Data
+            const visibleTiles = allTiles.filter(t => {
+                if (yearVal === "all") return true;
+                return t.year.toString() === yearVal;
+            });
+
+            document.getElementById("count-badge").innerText = `${visibleTiles.length} found`;
+            
+            // Clear & Rebuild
+            container.innerHTML = "";
+            footprintLayer.clearLayers();
+            highlightLayer.clearLayers();
+            currentlySelectedId = null;
+            document.getElementById("btn-download").disabled = true;
+
+            visibleTiles.forEach(t => {
+                const el = document.createElement("div");
+                el.className = "tile-item";
+                el.id = `row-${t.id}`;
+                el.innerHTML = `
+                    <div class="tile-info">
+                        <span class="tile-id">${t.id}</span>
+                        <span class="tile-meta">Year: ${t.year}</span>
+                    </div>
+                `;
+                el.onclick = () => selectTile(t, el);
+                container.appendChild(el);
+
+                const bounds = [[t.lat - 0.05, t.lon - 0.05], [t.lat + 0.05, t.lon + 0.05]];
+                L.rectangle(bounds, {
+                    color: "#888", weight: 1, fillOpacity: 0.05, dashArray: "4 4"
+                }).addTo(footprintLayer);
+            });
+        }
+
+        function selectTile(t, domElement) {
+            currentlySelectedId = t.id;
+            
+            document.querySelectorAll('.tile-item').forEach(d => d.classList.remove('active'));
+            domElement.classList.add('active');
+            
+            const btn = document.getElementById("btn-download");
+            btn.disabled = false;
+            btn.innerHTML = `⬇️ DOWNLOAD ${t.id}`;
+
+            highlightLayer.clearLayers();
+            const bounds = [[t.lat - 0.05, t.lon - 0.05], [t.lat + 0.05, t.lon + 0.05]];
+            L.rectangle(bounds, {
+                color: "#ff7800", weight: 3, fillOpacity: 0.1
+            }).addTo(highlightLayer);
+            
+            window.map.flyTo([t.lat, t.lon], 13);
+        }
+
+        function triggerDownload() {
+            if (currentlySelectedId) {
+                window.project_tile_py(currentlySelectedId);
+            }
+        }
+
+        // 3. RENDER FINAL IMAGE (With Persistent Popup)
+        function add_overlay(imgUrl, boundsJson, downloadUrl, tileId) {
+            const bounds = JSON.parse(boundsJson);
+            highlightLayer.clearLayers();
+
+            const imgOverlay = L.imageOverlay(imgUrl, bounds, {
+                opacity: 1.0, 
+                interactive: true // CRITICAL: Makes image clickable
+            }).addTo(imageLayer);
+
+            L.rectangle(bounds, {
+                color: "#ff7800", weight: 2, fill: false
+            }).addTo(imageLayer);
+
+            const popupContent = `
+                <div style="text-align:center; font-family:sans-serif;">
+                    <b>${tileId}</b><br>
+                    <a href="${downloadUrl}" class="dl-btn" target="_blank">Download .NPY</a>
+                </div>
+            `;
+            
+            imgOverlay.bindPopup(popupContent).openPopup();
+            
+            // Re-open popup on click if closed
+            imgOverlay.on('click', function() {
+                this.openPopup();
+            });
+        }
+    </script>
+</body>
+</html>
